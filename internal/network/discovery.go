@@ -1,0 +1,310 @@
+package network
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/mdns"
+)
+
+const (
+	// mDNS service type for PeerDrive
+	ServiceType = "_peerdrive._tcp"
+	// Domain for mDNS
+	ServiceDomain = "local."
+)
+
+// DiscoveryService handles peer discovery via mDNS
+type DiscoveryService struct {
+	serviceName     string
+	port            int
+	advertiseAddr   string
+	server          *mdns.Server
+	onPeerFound     func(string) error
+	discoveredPeers map[string]time.Time
+	peerLock        sync.RWMutex
+	stopCh          chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	logger          *slog.Logger
+}
+
+// NewDiscoveryService creates a new mDNS discovery service
+func NewDiscoveryService(serviceName string, port int, advertiseAddr string, logger *slog.Logger) *DiscoveryService {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &DiscoveryService{
+		serviceName:     serviceName,
+		port:            port,
+		advertiseAddr:   advertiseAddr,
+		discoveredPeers: make(map[string]time.Time),
+		stopCh:          make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		logger:          logger,
+	}
+}
+
+// Start begins advertising and discovering peers via mDNS
+func (ds *DiscoveryService) Start(ctx context.Context) error {
+	// Start advertising this node
+	if err := ds.startAdvertising(); err != nil {
+		return fmt.Errorf("failed to start mDNS advertising: %w", err)
+	}
+
+	// Start discovering other nodes
+	go ds.startDiscovery(ctx)
+
+	ds.logger.Info("mDNS discovery started", "service", ds.serviceName, "port", ds.port)
+	return nil
+}
+
+// Stop stops the discovery service
+func (ds *DiscoveryService) Stop() {
+	ds.cancel()
+	close(ds.stopCh)
+	if ds.server != nil {
+		ds.server.Shutdown()
+	}
+	ds.logger.Info("mDNS discovery stopped")
+}
+
+// SetPeerFoundCallback sets the callback for when a peer is discovered
+func (ds *DiscoveryService) SetPeerFoundCallback(callback func(string) error) {
+	ds.onPeerFound = callback
+}
+
+// startAdvertising advertises this node on the local network
+func (ds *DiscoveryService) startAdvertising() error {
+	// Get hostname
+	hostname, err := ds.getHostname()
+	if err != nil {
+		hostname = "peerdrive-node"
+	}
+
+	// Get local IPs
+	ips, err := ds.getLocalIPs()
+	if err != nil {
+		return err
+	}
+
+	// Create mDNS service
+	service, err := mdns.NewMDNSService(
+		hostname,
+		ServiceType,
+		ServiceDomain,
+		"",
+		ds.port,
+		ips,
+		[]string{"version=1.0", fmt.Sprintf("addr=%s", ds.advertiseAddr)},
+	)
+	if err != nil {
+		return err
+	}
+
+	// Create and start mDNS server
+	server, err := mdns.NewServer(&mdns.Config{Zone: service})
+	if err != nil {
+		return err
+	}
+
+	ds.server = server
+	return nil
+}
+
+// startDiscovery continuously discovers peers on the local network
+func (ds *DiscoveryService) startDiscovery(ctx context.Context) {
+	// Initial discovery
+	ds.discoverPeers(ctx)
+
+	// Periodic rediscovery every 30 seconds
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ds.discoverPeers(ctx)
+		case <-ctx.Done():
+			return
+		case <-ds.stopCh:
+			return
+		}
+	}
+}
+
+// discoverPeers performs a single discovery scan
+func (ds *DiscoveryService) discoverPeers(ctx context.Context) {
+	// Create entries channel
+	entriesCh := make(chan *mdns.ServiceEntry, 10)
+
+	// Start discovery goroutine
+	go func() {
+		defer close(entriesCh)
+
+		// Query for PeerDrive services
+		params := &mdns.QueryParam{
+			Service:             ServiceType,
+			Domain:              ServiceDomain,
+			Timeout:             3 * time.Second,
+			Entries:             entriesCh,
+			WantUnicastResponse: false,
+		}
+
+		if err := mdns.Query(params); err != nil {
+			ds.logger.Debug("mDNS query error", "err", err)
+		}
+	}()
+
+	// Process discovered entries
+	for entry := range entriesCh {
+		if ctx.Err() != nil {
+			return
+		}
+		ds.handleDiscoveredPeer(ctx, entry)
+	}
+}
+
+// handleDiscoveredPeer processes a discovered peer
+func (ds *DiscoveryService) handleDiscoveredPeer(ctx context.Context, entry *mdns.ServiceEntry) {
+	// Skip if it's our own service
+	if entry.Port == ds.port {
+		// Additional check: compare IPs
+		localIPs, _ := ds.getLocalIPs()
+		for _, localIP := range localIPs {
+			if entry.AddrV4 != nil && entry.AddrV4.Equal(localIP) {
+				return
+			}
+			if entry.AddrV6 != nil && entry.AddrV6.Equal(localIP) {
+				return
+			}
+		}
+	}
+
+	// Determine peer address
+	var peerAddr string
+	if entry.AddrV4 != nil {
+		peerAddr = fmt.Sprintf("%s:%d", entry.AddrV4.String(), entry.Port)
+	} else if entry.AddrV6 != nil {
+		peerAddr = fmt.Sprintf("[%s]:%d", entry.AddrV6.String(), entry.Port)
+	} else {
+		return
+	}
+
+	// Check if we've already discovered this peer recently
+	ds.peerLock.Lock()
+	lastSeen, exists := ds.discoveredPeers[peerAddr]
+	if exists && time.Since(lastSeen) < 5*time.Minute {
+		ds.peerLock.Unlock()
+		return
+	}
+	ds.discoveredPeers[peerAddr] = time.Now()
+	ds.peerLock.Unlock()
+
+	ds.logger.Info("Discovered peer via mDNS", "peer", peerAddr, "name", entry.Name)
+
+	// Notify callback
+	if ds.onPeerFound != nil {
+		go func() {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := ds.onPeerFound(peerAddr); err != nil {
+				ds.logger.Debug("Failed to connect to discovered peer", "peer", peerAddr, "err", err)
+			} else {
+				ds.logger.Info("Successfully connected to peer discovered via mDNS", "peer", peerAddr)
+			}
+		}()
+	}
+}
+
+// getHostname returns the system hostname
+func (ds *DiscoveryService) getHostname() (string, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	// Sanitize hostname for mDNS (no spaces or special chars)
+	hostname = strings.ReplaceAll(hostname, " ", "-")
+	return hostname, nil
+}
+
+// getLocalIPs returns all non-loopback local IP addresses
+func (ds *DiscoveryService) getLocalIPs() ([]net.IP, error) {
+	var ips []net.IP
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range ifaces {
+		// Skip down interfaces
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		// Skip loopback
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			// Skip loopback addresses
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+
+			ips = append(ips, ip)
+		}
+	}
+
+	return ips, nil
+}
+
+// GetDiscoveredPeers returns the list of discovered peers
+func (ds *DiscoveryService) GetDiscoveredPeers() []string {
+	ds.peerLock.RLock()
+	defer ds.peerLock.RUnlock()
+
+	peers := make([]string, 0, len(ds.discoveredPeers))
+	for peer := range ds.discoveredPeers {
+		peers = append(peers, peer)
+	}
+	return peers
+}
+
+// CleanupOldPeers removes peers not seen in the last 10 minutes
+func (ds *DiscoveryService) CleanupOldPeers() {
+	ds.peerLock.Lock()
+	defer ds.peerLock.Unlock()
+
+	cutoff := time.Now().Add(-10 * time.Minute)
+	for peer, lastSeen := range ds.discoveredPeers {
+		if lastSeen.Before(cutoff) {
+			delete(ds.discoveredPeers, peer)
+			ds.logger.Debug("Removed stale peer from discovery cache", "peer", peer)
+		}
+	}
+}
